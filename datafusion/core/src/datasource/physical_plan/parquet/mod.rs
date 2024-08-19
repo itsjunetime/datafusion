@@ -61,6 +61,7 @@ pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
 pub use metrics::ParquetFileMetrics;
 use opener::ParquetOpener;
 pub use reader::{DefaultParquetFileReaderFactory, ParquetFileReaderFactory};
+pub use row_filter::would_column_prevent_pushdown;
 pub use writer::plan_to_parquet;
 
 /// Execution plan for reading one or more Parquet files.
@@ -210,9 +211,9 @@ pub use writer::plan_to_parquet;
 /// # Execution Overview
 ///
 /// * Step 1: [`ParquetExec::execute`] is called, returning a [`FileStream`]
-///   configured to open parquet files with a `ParquetOpener`.
+///   configured to open parquet files with a [`ParquetOpener`].
 ///
-/// * Step 2: When the stream is polled, the `ParquetOpener` is called to open
+/// * Step 2: When the stream is polled, the [`ParquetOpener`] is called to open
 ///   the file.
 ///
 /// * Step 3: The `ParquetOpener` gets the [`ParquetMetaData`] (file metadata)
@@ -685,10 +686,12 @@ impl ExecutionPlan for ParquetExec {
         partition_index: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let projection = match self.base_config.file_column_projection_indices() {
-            Some(proj) => proj,
-            None => (0..self.base_config.file_schema.fields().len()).collect(),
-        };
+        let projection = self
+            .base_config
+            .file_column_projection_indices()
+            .unwrap_or_else(|| {
+                (0..self.base_config.file_schema.fields().len()).collect()
+            });
 
         let parquet_file_reader_factory = self
             .parquet_file_reader_factory
@@ -698,8 +701,7 @@ impl ExecutionPlan for ParquetExec {
                 ctx.runtime_env()
                     .object_store(&self.base_config.object_store_url)
                     .map(|store| {
-                        Arc::new(DefaultParquetFileReaderFactory::new(store))
-                            as Arc<dyn ParquetFileReaderFactory>
+                        Arc::new(DefaultParquetFileReaderFactory::new(store)) as _
                     })
             })?;
 

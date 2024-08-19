@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use super::ListingTableUrl;
 use super::PartitionedFile;
+use crate::datasource::physical_plan::parquet::would_column_prevent_pushdown;
 use crate::execution::context::SessionState;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{BinaryExpr, Operator};
@@ -51,12 +52,26 @@ use object_store::{ObjectMeta, ObjectStore};
 /// - the table provider can filter the table partition values with this expression
 /// - the expression can be marked as `TableProviderFilterPushDown::Exact` once this filtering
 ///   was performed
-pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
+pub fn expr_applicable_for_schemas(
+    expr: &Expr,
+    file_schema: &Schema,
+    table_schema: &Schema,
+) -> bool {
     let mut is_applicable = true;
     expr.apply(|expr| {
         match expr {
-            Expr::Column(Column { ref name, .. }) => {
-                is_applicable &= col_names.contains(name);
+            // the `would_column_prevent_pushdowns` fn which handles checking if this can be
+            // pushed down (which we need to determine for what this fn does) only cares about
+            // `Columns` (no matter how nested), and we already need to do tree recursion to
+            // get to the ScalarFunction variant, so we just only grab the column when we get there.
+            Expr::Column(column) => {
+                // it's only still applicable if the column we're currently processing wouldn't
+                // prevent pushdown
+                is_applicable &= !would_column_prevent_pushdown(
+                    column.name(),
+                    file_schema,
+                    table_schema,
+                );
                 if is_applicable {
                     Ok(TreeNodeRecursion::Jump)
                 } else {
@@ -77,18 +92,18 @@ pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
             | Expr::IsNotFalse(_)
             | Expr::IsNotUnknown(_)
             | Expr::Negative(_)
-            | Expr::Cast { .. }
-            | Expr::TryCast { .. }
-            | Expr::BinaryExpr { .. }
-            | Expr::Between { .. }
-            | Expr::Like { .. }
-            | Expr::SimilarTo { .. }
-            | Expr::InList { .. }
-            | Expr::Exists { .. }
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::BinaryExpr(_)
+            | Expr::Between(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_)
+            | Expr::InList(_)
+            | Expr::Exists(_)
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)
             | Expr::GroupingSet(_)
-            | Expr::Case { .. } => Ok(TreeNodeRecursion::Continue),
+            | Expr::Case(_) => Ok(TreeNodeRecursion::Continue),
 
             Expr::ScalarFunction(scalar_function) => {
                 match scalar_function.func.signature().volatility {
@@ -514,12 +529,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Not;
-
     use futures::StreamExt;
 
     use crate::test::object_store::make_test_store_and_state;
-    use datafusion_expr::{case, col, lit, Expr};
+    use datafusion_expr::{col, lit, Expr};
 
     use super::*;
 
@@ -741,41 +754,6 @@ mod tests {
                 vec!["mypartition"]
             )
         );
-    }
-
-    #[test]
-    fn test_expr_applicable_for_cols() {
-        assert!(expr_applicable_for_cols(
-            &[String::from("c1")],
-            &Expr::eq(col("c1"), lit("value"))
-        ));
-        assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
-            &Expr::eq(col("c2"), lit("value"))
-        ));
-        assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
-            &Expr::eq(col("c1"), col("c2"))
-        ));
-        assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
-            &Expr::eq(col("c1"), col("c2"))
-        ));
-        assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
-            &(Expr::eq(col("c1"), col("c2").alias("c2_alias"))).not()
-        ));
-        assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
-            &(case(col("c1"))
-                .when(lit("v1"), lit(true))
-                .otherwise(lit(false))
-                .expect("valid case expr"))
-        ));
-        // static expression not relevant in this context but we
-        // test it as an edge case anyway in case we want to generalize
-        // this helper function
-        assert!(expr_applicable_for_cols(&[], &lit(true)));
     }
 
     #[test]
