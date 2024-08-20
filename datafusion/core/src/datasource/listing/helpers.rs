@@ -52,87 +52,93 @@ use object_store::{ObjectMeta, ObjectStore};
 /// - the table provider can filter the table partition values with this expression
 /// - the expression can be marked as `TableProviderFilterPushDown::Exact` once this filtering
 ///   was performed
-pub fn expr_applicable_for_schemas(
-    expr: &Expr,
-    file_schema: &Schema,
-    table_schema: &Schema,
-) -> bool {
+pub fn expr_applicable_for_cols(expr: &Expr, cols: &[&str]) -> bool {
     let mut is_applicable = true;
-    expr.apply(|expr| {
-        match expr {
-            // the `would_column_prevent_pushdowns` fn which handles checking if this can be
-            // pushed down (which we need to determine for what this fn does) only cares about
-            // `Columns` (no matter how nested), and we already need to do tree recursion to
-            // get to the ScalarFunction variant, so we just only grab the column when we get there.
-            Expr::Column(column) => {
-                // it's only still applicable if the column we're currently processing wouldn't
-                // prevent pushdown
-                is_applicable &= !would_column_prevent_pushdown(
-                    column.name(),
-                    file_schema,
-                    table_schema,
-                );
-                if is_applicable {
-                    Ok(TreeNodeRecursion::Jump)
-                } else {
+    expr.apply(|expr| match expr {
+        Expr::Column(column) => {
+            is_applicable &= cols.contains(&column.name());
+            if is_applicable {
+                Ok(TreeNodeRecursion::Jump)
+            } else {
+                Ok(TreeNodeRecursion::Stop)
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Alias(_)
+        | Expr::OuterReferenceColumn(_, _)
+        | Expr::ScalarVariable(_, _)
+        | Expr::Not(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::Negative(_)
+        | Expr::Cast(_)
+        | Expr::TryCast(_)
+        | Expr::BinaryExpr(_)
+        | Expr::Between(_)
+        | Expr::Like(_)
+        | Expr::SimilarTo(_)
+        | Expr::InList(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::GroupingSet(_)
+        | Expr::Case(_) => Ok(TreeNodeRecursion::Continue),
+
+        Expr::ScalarFunction(scalar_function) => {
+            match scalar_function.func.signature().volatility {
+                Volatility::Immutable => Ok(TreeNodeRecursion::Continue),
+                // TODO: Stable functions could be `applicable`, but that would require access to the context
+                Volatility::Stable | Volatility::Volatile => {
+                    is_applicable = false;
                     Ok(TreeNodeRecursion::Stop)
                 }
             }
-            Expr::Literal(_)
-            | Expr::Alias(_)
-            | Expr::OuterReferenceColumn(_, _)
-            | Expr::ScalarVariable(_, _)
-            | Expr::Not(_)
-            | Expr::IsNotNull(_)
-            | Expr::IsNull(_)
-            | Expr::IsTrue(_)
-            | Expr::IsFalse(_)
-            | Expr::IsUnknown(_)
-            | Expr::IsNotTrue(_)
-            | Expr::IsNotFalse(_)
-            | Expr::IsNotUnknown(_)
-            | Expr::Negative(_)
-            | Expr::Cast(_)
-            | Expr::TryCast(_)
-            | Expr::BinaryExpr(_)
-            | Expr::Between(_)
-            | Expr::Like(_)
-            | Expr::SimilarTo(_)
-            | Expr::InList(_)
-            | Expr::Exists(_)
-            | Expr::InSubquery(_)
-            | Expr::ScalarSubquery(_)
-            | Expr::GroupingSet(_)
-            | Expr::Case(_) => Ok(TreeNodeRecursion::Continue),
+        }
 
-            Expr::ScalarFunction(scalar_function) => {
-                match scalar_function.func.signature().volatility {
-                    Volatility::Immutable => Ok(TreeNodeRecursion::Continue),
-                    // TODO: Stable functions could be `applicable`, but that would require access to the context
-                    Volatility::Stable | Volatility::Volatile => {
-                        is_applicable = false;
-                        Ok(TreeNodeRecursion::Stop)
-                    }
-                }
-            }
-
-            // TODO other expressions are not handled yet:
-            // - AGGREGATE, WINDOW and SORT should not end up in filter conditions, except maybe in some edge cases
-            // - Can `Wildcard` be considered as a `Literal`?
-            // - ScalarVariable could be `applicable`, but that would require access to the context
-            Expr::AggregateFunction { .. }
-            | Expr::Sort { .. }
-            | Expr::WindowFunction { .. }
-            | Expr::Wildcard { .. }
-            | Expr::Unnest { .. }
-            | Expr::Placeholder(_) => {
-                is_applicable = false;
-                Ok(TreeNodeRecursion::Stop)
-            }
+        // TODO other expressions are not handled yet:
+        // - AGGREGATE, WINDOW and SORT should not end up in filter conditions, except maybe in some edge cases
+        // - Can `Wildcard` be considered as a `Literal`?
+        // - ScalarVariable could be `applicable`, but that would require access to the context
+        Expr::AggregateFunction { .. }
+        | Expr::Sort { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::Wildcard { .. }
+        | Expr::Unnest { .. }
+        | Expr::Placeholder(_) => {
+            is_applicable = false;
+            Ok(TreeNodeRecursion::Stop)
         }
     })
     .unwrap();
     is_applicable
+}
+
+pub fn can_expr_be_pushed_down_with_schemas(
+    expr: &Expr,
+    file_schema: &Schema,
+    table_schema: &Schema,
+) -> bool {
+    let mut can_be_pushed = true;
+    expr.apply(|expr| match expr {
+        Expr::Column(column) => {
+            can_be_pushed &=
+                would_column_prevent_pushdown(column.name(), file_schema, table_schema);
+            Ok(if can_be_pushed {
+                TreeNodeRecursion::Jump
+            } else {
+                TreeNodeRecursion::Stop
+            })
+        }
+        _ => Ok(TreeNodeRecursion::Continue), // we never return an Err, so we can safely unwrap this
+    })
+    .unwrap();
+    can_be_pushed
 }
 
 /// The maximum number of concurrent listing requests
